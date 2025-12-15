@@ -40,39 +40,15 @@
         "description": "Enable public network access to the Automation Account"
       }
     },
-    "runtimeEnvironmentName": {
-      "type": "string",
-      "defaultValue": "RuntimeEnv-PowerShell",
-      "metadata": {
-        "description": "Name of the runtime environment"
-      }
-    },
     "powerShellVersion": {
       "type": "string",
       "defaultValue": "7.2",
       "allowedValues": [
         "5.1",
-        "7.1",
         "7.2"
       ],
       "metadata": {
-        "description": "PowerShell version for the runtime environment"
-      }
-    },
-    "packagesToInstall": {
-      "type": "array",
-      "defaultValue": [
-        {
-          "name": "Az.Accounts",
-          "version": "latest"
-        },
-        {
-          "name": "Az.ResourceGraph",
-          "version": "latest"
-        }
-      ],
-      "metadata": {
-        "description": "Array of PowerShell packages to install from PSGallery"
+        "description": "PowerShell version for the runbook (5.1 or 7.2)"
       }
     },
     "runbookName": {
@@ -148,6 +124,7 @@
         }
       }
     },
+    "runbookType": "[if(equals(parameters('powerShellVersion'), '5.1'), 'PowerShell', 'PowerShell72')]",
     "runbookContent": "[concat('Import-Module Az.Accounts\nImport-Module Az.ResourceGraph\nConnect-AzAccount -Identity\nfunction Send-ToLogAnalytics {\n    param (\n        [Parameter(Mandatory)]\n        [string]$WorkspaceId,\n        [Parameter(Mandatory)]\n        [string]$SharedKey,\n        [Parameter(Mandatory)]\n        [string]$LogType,\n        [Parameter(Mandatory)]\n        [object]$Payload\n    )\n    $json = $Payload | ConvertTo-Json -Depth 10\n    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)\n    $rfc1123date = [DateTime]::UtcNow.ToString(\"r\")\n    $stringToSign = \"POST`n$($bytes.Length)`napplication/json`nx-ms-date:$rfc1123date`n/api/logs\"\n    $keyBytes = [Convert]::FromBase64String($SharedKey)\n    $hmacsha256 = New-Object System.Security.Cryptography.HMACSHA256\n    $hmacsha256.Key = $keyBytes\n    $signature = [Convert]::ToBase64String(\n        $hmacsha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign))\n    )\n    $auth = \"SharedKey ${WorkspaceId}:$signature\"\n    $uri = \"https://$WorkspaceId.ods.opinsights.azure.com/api/logs?api-version=2016-04-01\"\n    Invoke-RestMethod -Method Post -Uri $uri -Headers @{\n        Authorization = $auth\n        \"Log-Type\"    = $LogType\n        \"x-ms-date\"   = $rfc1123date\n    } -ContentType \"application/json\" -Body $bytes\n}\n$query = @\"\nresources\n| where type == ''microsoft.hybridcompute/machines/extensions''\n| extend\n    machineName = split(id, ''/'')[8],\n    extensionName = name,\n    provisioningState = tostring(properties.provisioningState),\n    statusMessage = tostring(properties.statusMessage)\n| where provisioningState !in (''Succeeded'')\n| project\n    machineName,\n    extensionName,\n    provisioningState\n\"@\nSearch-AzGraph -Query $query -First 1000\n$results = Search-AzGraph -Query $query -First 1000\n$WorkspaceId=\"', parameters('logAnalyticsWorkspaceId'), '\"\n$SharedKey=Get-AutomationVariable -Name \"LogAnalyticsPrimaryKey\"\nif ($results.Count -gt 0) {\n    $logPayload = $results | ForEach-Object {\n        [PSCustomObject]@{\n            TimeGenerated     = (Get-Date).ToUniversalTime()\n            MachineName       = $_.machineName\n            ExtensionName     = $_.extensionName\n            ProvisioningState = $_.provisioningState\n            StatusMessage     = $_.statusMessage\n            ResourceGroup     = $_.resourceGroup\n            SubscriptionId    = $_.subscriptionId\n        }\n    }\n    Send-ToLogAnalytics `\n        -WorkspaceId $WorkspaceId `\n        -SharedKey $SharedKey `\n        -LogType \"ArcExtensionHealth\" `\n        -Payload $logPayload\n}')]"
   },
   "resources": [
@@ -169,21 +146,30 @@
       }
     },
     {
-      "type": "Microsoft.Automation/automationAccounts/runtimeEnvironments",
+      "type": "Microsoft.Automation/automationAccounts/modules",
       "apiVersion": "2023-11-01",
-      "name": "[format('{0}/{1}', parameters('automationAccountName'), parameters('runtimeEnvironmentName'))]",
-      "location": "[parameters('location')]",
+      "name": "[format('{0}/{1}', parameters('automationAccountName'), 'Az.Accounts')]",
       "properties": {
-        "runtime": {
-          "language": "PowerShell",
-          "version": "[parameters('powerShellVersion')]"
-        },
-        "defaultPackages": {
-          "Az.Accounts": "[if(equals(length(parameters('packagesToInstall')), 0), 'latest', json('null'))]"
+        "contentLink": {
+          "uri": "https://www.powershellgallery.com/api/v2/package/Az.Accounts"
         }
       },
       "dependsOn": [
         "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/modules",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', parameters('automationAccountName'), 'Az.ResourceGraph')]",
+      "properties": {
+        "contentLink": {
+          "uri": "https://www.powershellgallery.com/api/v2/package/Az.ResourceGraph"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
+        "[resourceId('Microsoft.Automation/automationAccounts/modules', parameters('automationAccountName'), 'Az.Accounts')]"
       ]
     },
     {
@@ -205,7 +191,7 @@
       "name": "[format('{0}/{1}', parameters('automationAccountName'), parameters('runbookName'))]",
       "location": "[parameters('location')]",
       "properties": {
-        "runbookType": "PowerShell72",
+        "runbookType": "[variables('runbookType')]",
         "logProgress": true,
         "logVerbose": false,
         "description": "Monitors Azure Arc extension health and sends failed states to Log Analytics",
@@ -215,7 +201,8 @@
       },
       "dependsOn": [
         "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
-        "[resourceId('Microsoft.Automation/automationAccounts/runtimeEnvironments', parameters('automationAccountName'), parameters('runtimeEnvironmentName'))]"
+        "[resourceId('Microsoft.Automation/automationAccounts/modules', parameters('automationAccountName'), 'Az.Accounts')]",
+        "[resourceId('Microsoft.Automation/automationAccounts/modules', parameters('automationAccountName'), 'Az.ResourceGraph')]"
       ]
     },
     {

@@ -1,0 +1,272 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "automationAccountName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Automation Account"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for the Automation Account"
+      }
+    },
+    "identityType": {
+      "type": "string",
+      "defaultValue": "SystemAssigned",
+      "allowedValues": [
+        "SystemAssigned",
+        "UserAssigned"
+      ],
+      "metadata": {
+        "description": "Type of managed identity for the Automation Account"
+      }
+    },
+    "userAssignedIdentityResourceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource ID of the user-assigned managed identity (required if identityType is UserAssigned)"
+      }
+    },
+    "publicNetworkAccess": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Enable public network access to the Automation Account"
+      }
+    },
+    "runtimeEnvironmentName": {
+      "type": "string",
+      "defaultValue": "RuntimeEnv-PowerShell",
+      "metadata": {
+        "description": "Name of the runtime environment"
+      }
+    },
+    "powerShellVersion": {
+      "type": "string",
+      "defaultValue": "7.2",
+      "allowedValues": [
+        "5.1",
+        "7.1",
+        "7.2"
+      ],
+      "metadata": {
+        "description": "PowerShell version for the runtime environment"
+      }
+    },
+    "packagesToInstall": {
+      "type": "array",
+      "defaultValue": [
+        {
+          "name": "Az.Accounts",
+          "version": "latest"
+        },
+        {
+          "name": "Az.ResourceGraph",
+          "version": "latest"
+        }
+      ],
+      "metadata": {
+        "description": "Array of PowerShell packages to install from PSGallery"
+      }
+    },
+    "runbookName": {
+      "type": "string",
+      "defaultValue": "ArcExtensionHealthCheck",
+      "metadata": {
+        "description": "Name of the runbook"
+      }
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Log Analytics Workspace ID (Customer ID)"
+      }
+    },
+    "logAnalyticsPrimaryKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Log Analytics Workspace Primary Key"
+      }
+    },
+    "scheduleName": {
+      "type": "string",
+      "defaultValue": "ArcHealthCheckSchedule",
+      "metadata": {
+        "description": "Name of the schedule for the runbook"
+      }
+    },
+    "scheduleFrequency": {
+      "type": "string",
+      "defaultValue": "Hour",
+      "allowedValues": [
+        "Hour",
+        "Day",
+        "Week",
+        "Month"
+      ],
+      "metadata": {
+        "description": "Frequency of the schedule"
+      }
+    },
+    "scheduleInterval": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "Interval for the schedule frequency"
+      }
+    },
+    "scheduleStartTime": {
+      "type": "string",
+      "defaultValue": "[dateTimeAdd(utcNow(), 'PT15M')]",
+      "metadata": {
+        "description": "Start time for the schedule (defaults to 15 minutes from now)"
+      }
+    },
+    "scheduleTimeZone": {
+      "type": "string",
+      "defaultValue": "UTC",
+      "metadata": {
+        "description": "Time zone for the schedule"
+      }
+    }
+  },
+  "variables": {
+    "identityConfig": {
+      "SystemAssigned": {
+        "type": "SystemAssigned"
+      },
+      "UserAssigned": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[parameters('userAssignedIdentityResourceId')]": {}
+        }
+      }
+    },
+    "runbookContent": "[concat('Import-Module Az.Accounts\nImport-Module Az.ResourceGraph\nConnect-AzAccount -Identity\nfunction Send-ToLogAnalytics {\n    param (\n        [Parameter(Mandatory)]\n        [string]$WorkspaceId,\n        [Parameter(Mandatory)]\n        [string]$SharedKey,\n        [Parameter(Mandatory)]\n        [string]$LogType,\n        [Parameter(Mandatory)]\n        [object]$Payload\n    )\n    $json = $Payload | ConvertTo-Json -Depth 10\n    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)\n    $rfc1123date = [DateTime]::UtcNow.ToString(\"r\")\n    $stringToSign = \"POST`n$($bytes.Length)`napplication/json`nx-ms-date:$rfc1123date`n/api/logs\"\n    $keyBytes = [Convert]::FromBase64String($SharedKey)\n    $hmacsha256 = New-Object System.Security.Cryptography.HMACSHA256\n    $hmacsha256.Key = $keyBytes\n    $signature = [Convert]::ToBase64String(\n        $hmacsha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign))\n    )\n    $auth = \"SharedKey ${WorkspaceId}:$signature\"\n    $uri = \"https://$WorkspaceId.ods.opinsights.azure.com/api/logs?api-version=2016-04-01\"\n    Invoke-RestMethod -Method Post -Uri $uri -Headers @{\n        Authorization = $auth\n        \"Log-Type\"    = $LogType\n        \"x-ms-date\"   = $rfc1123date\n    } -ContentType \"application/json\" -Body $bytes\n}\n$query = @\"\nresources\n| where type == ''microsoft.hybridcompute/machines/extensions''\n| extend\n    machineName = split(id, ''/'')[8],\n    extensionName = name,\n    provisioningState = tostring(properties.provisioningState),\n    statusMessage = tostring(properties.statusMessage)\n| where provisioningState !in (''Succeeded'')\n| project\n    machineName,\n    extensionName,\n    provisioningState\n\"@\nSearch-AzGraph -Query $query -First 1000\n$results = Search-AzGraph -Query $query -First 1000\n$WorkspaceId=\"', parameters('logAnalyticsWorkspaceId'), '\"\n$SharedKey=Get-AutomationVariable -Name \"LogAnalyticsPrimaryKey\"\nif ($results.Count -gt 0) {\n    $logPayload = $results | ForEach-Object {\n        [PSCustomObject]@{\n            TimeGenerated     = (Get-Date).ToUniversalTime()\n            MachineName       = $_.machineName\n            ExtensionName     = $_.extensionName\n            ProvisioningState = $_.provisioningState\n            StatusMessage     = $_.statusMessage\n            ResourceGroup     = $_.resourceGroup\n            SubscriptionId    = $_.subscriptionId\n        }\n    }\n    Send-ToLogAnalytics `\n        -WorkspaceId $WorkspaceId `\n        -SharedKey $SharedKey `\n        -LogType \"ArcExtensionHealth\" `\n        -Payload $logPayload\n}')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Automation/automationAccounts",
+      "apiVersion": "2023-11-01",
+      "name": "[parameters('automationAccountName')]",
+      "location": "[parameters('location')]",
+      "identity": "[if(equals(parameters('identityType'), 'SystemAssigned'), variables('identityConfig').SystemAssigned, variables('identityConfig').UserAssigned)]",
+      "properties": {
+        "sku": {
+          "name": "Basic"
+        },
+        "publicNetworkAccess": "[if(parameters('publicNetworkAccess'), 'true', 'false')]",
+        "disableLocalAuth": false,
+        "encryption": {
+          "keySource": "Microsoft.Automation"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/runtimeEnvironments",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', parameters('automationAccountName'), parameters('runtimeEnvironmentName'))]",
+      "properties": {
+        "runtime": {
+          "language": "PowerShell",
+          "version": "[parameters('powerShellVersion')]"
+        },
+        "defaultPackages": {
+          "Az.Accounts": "[if(equals(length(parameters('packagesToInstall')), 0), 'latest', json('null'))]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/variables",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', parameters('automationAccountName'), 'LogAnalyticsPrimaryKey')]",
+      "properties": {
+        "isEncrypted": true,
+        "value": "[concat('\"', parameters('logAnalyticsPrimaryKey'), '\"')]",
+        "description": "Encrypted Log Analytics Primary Key for data ingestion"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/runbooks",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', parameters('automationAccountName'), parameters('runbookName'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "runbookType": "PowerShell72",
+        "logProgress": true,
+        "logVerbose": false,
+        "description": "Monitors Azure Arc extension health and sends failed states to Log Analytics",
+        "publishContentLink": {
+          "version": "1.0.0.0"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
+        "[resourceId('Microsoft.Automation/automationAccounts/runtimeEnvironments', parameters('automationAccountName'), parameters('runtimeEnvironmentName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/schedules",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', parameters('automationAccountName'), parameters('scheduleName'))]",
+      "properties": {
+        "description": "Schedule for Arc Extension Health Check",
+        "startTime": "[parameters('scheduleStartTime')]",
+        "timeZone": "[parameters('scheduleTimeZone')]",
+        "frequency": "[parameters('scheduleFrequency')]",
+        "interval": "[parameters('scheduleInterval')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/jobSchedules",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', parameters('automationAccountName'), guid(parameters('automationAccountName'), parameters('runbookName'), parameters('scheduleName')))]",
+      "properties": {
+        "runbook": {
+          "name": "[parameters('runbookName')]"
+        },
+        "schedule": {
+          "name": "[parameters('scheduleName')]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
+        "[resourceId('Microsoft.Automation/automationAccounts/runbooks', parameters('automationAccountName'), parameters('runbookName'))]",
+        "[resourceId('Microsoft.Automation/automationAccounts/schedules', parameters('automationAccountName'), parameters('scheduleName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "automationAccountName": {
+      "type": "string",
+      "value": "[parameters('automationAccountName')]"
+    },
+    "automationAccountId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+    },
+    "runbookName": {
+      "type": "string",
+      "value": "[parameters('runbookName')]"
+    },
+    "identityPrincipalId": {
+      "type": "string",
+      "value": "[if(equals(parameters('identityType'), 'SystemAssigned'), reference(resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName')), '2023-11-01', 'Full').identity.principalId, 'UserAssigned')]"
+    }
+  }
+}
